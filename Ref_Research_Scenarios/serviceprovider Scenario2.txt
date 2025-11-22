@@ -1,0 +1,251 @@
+//service/provider Scenario2
+
+// services/Provider.js
+const Provider = require('../models/Provider');
+const Account = require('../models/Account');
+
+exports.Provider = Provider;
+
+const serviceService = require("./Service");
+const serviceConsumer = require("./Consumer");
+const serviceOfferCapacity = require("./OfferCapacity");
+const servicePoolCapacity = require("./PoolCapacity");
+
+// --- AI Integration ---
+const axios = require('axios');
+require('dotenv').config();
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// ----------------------
+
+const logger = require('../utils/logger');
+const serviceOfferDirect = require("./OfferDirect");
+
+exports.create = (account, options = {}) => {
+    return new Promise(async (resolve, reject) => {
+        try {
+            logger.silly("serviceProvider.create() called with: accountId: " + account.id);
+            if (!account) throw ("Account not defined");
+
+            let provider = new Provider({
+                account: account._id,
+                agentType: options.agentType || 'random' 
+            });
+
+            await provider.save();
+            logger.info(`serviceProvider.create() created provider with providerId: ${provider.id} (Type: ${provider.agentType})`);
+            resolve(provider);
+        } catch (e) {
+            logger.error("serviceProvider.create() error: " + e);
+            reject(e);
+        }
+    })
+}
+
+exports.offerDirectReceive = (provider, offerDirect) => {
+    return new Promise(async (resolve, reject) => {
+        try {
+            logger.silly("serviceProvider.offerDirectReceived() called with offerDirect: " + offerDirect._id);
+            if (!offerDirect) return reject("Offer direct not defined");
+            if (offerDirect.state !== "MARKET") return reject("Offer direct not in state MARKET");
+            if (!provider) return reject("Provider not found");
+
+            let decision = await decisionOfferDirect(provider, offerDirect);
+            
+            let consumer = await serviceConsumer.Consumer.findOne({account: offerDirect.seller});
+            if (!consumer) return reject("Consumer not found");
+
+            switch (decision) {
+                case "accept": {
+                    // 1. โอนเงิน
+                    let providerAccount = await Account.findById(provider.account);
+                    let consumerAccount = await Account.findById(offerDirect.seller);
+                    let price = offerDirect.price;
+
+                    if (providerAccount && consumerAccount) {
+                        consumerAccount.balance -= price;
+                        providerAccount.balance += price;
+                        await consumerAccount.save();
+                        await providerAccount.save();
+                        logger.info(`TRANSACTION: Provider ${provider._id} earned ${price}. New balance: ${providerAccount.balance}`);
+                        logger.info(`TRANSACTION: Consumer ${consumer.id} spent ${price}. New balance: ${consumerAccount.balance}`);
+                    }
+
+                    // 2. เปลี่ยนสถานะ Offer
+                    offerDirect = await serviceConsumer.offerDirectAccepted(consumer, offerDirect);
+                    logger.silly("serviceProvider.offerDirectReceived() accepted offer direct: " + offerDirect.id);
+                    
+                    // 3. เริ่ม Service และ **บันทึก Provider ID** (จุดสำคัญที่แก้ไข)
+                    let service = await serviceService.Service.findById(offerDirect.service);
+                    
+                    service.provider = provider._id; // <-- บันทึกว่าใครทำงานนี้
+                    await service.save();            // <-- บันทึกลง DB
+                    
+                    logger.silly("serviceProvider.offerDirectReceived() commence service: " + service.id);
+                    await serviceService.commence(service);
+                    logger.silly("serviceProvider.offerDirectReceived() commenced service: " + service.id);
+                }
+                break;
+                case "reject":{
+                    offerDirect = await serviceConsumer.offerDirectRejected(offerDirect);
+                    logger.silly("serviceProvider.offerDirectReceived() rejected offer direct: " + offerDirect._id);
+                }
+                break;
+                case "postpone":{
+                    // ใน Scenario 2 (No Pool) โค้ดส่วนนี้จะไม่ถูกเรียกใช้โดย Random Agent
+                    logger.silly("serviceProvider.offerDirectReceived() postponed offer direct: " + offerDirect._id);
+                    let offerCapacity = await serviceOfferCapacity.create(offerDirect, clcOfferCapacityPrice(offerDirect), clcOfferCapacityExpiryTimestamp(offerDirect));                 
+                    await servicePoolCapacity.offerCapacityPost(offerCapacity);
+                }
+            }
+            resolve(offerDirect);
+        } catch (e) {
+            logger.error("serviceProvider.offerDirectReceived() error: " + e);
+            reject(e);
+        }
+    })
+}
+
+// (นี่คือฟังก์ชัน getLLMDecision เวอร์ชันแก้ไขสมบูรณ์)
+
+async function getLLMDecision(provider, offer) {
+    logger.info(`[AI Agent ${provider._id}] กำลังเรียก LLM (GPT-3-Turbo)...`);
+
+    // 1. ค้นหา Service (เหมือนเดิม)
+    let service = await serviceService.Service.findById(offer.service);
+    let activeServices = await serviceService.Service.countDocuments({provider: provider._id, state: "ACTIVE"});
+    const freeSlots = provider.servicesLimit - activeServices;
+
+    // (วางโค้ดนี้ก่อน const context)
+
+    // --- 1. ค้นหา "Services" ทั้งหมดที่ Provider คนนี้เคยรับ ---
+    const providerServices = await serviceService.Service.find({
+        provider: provider._id // ค้นหา Services ที่มี provider ID นี้
+    }).select('_id'); // เราต้องการแค่ ID ของ Service
+
+    // แปลงผลลัพธ์ [ {_id: ...}, ... ] ให้เป็นอาร์เรย์ของ ID [ ..., ... ]
+    const serviceIds = providerServices.map(s => s._id);
+
+    // --- 2. Query ประวัติ (History) ที่ถูกต้อง ---
+    // ค้นหา 10 Offers ล่าสุดที่ "ACCEPTED" และ "เชื่อมโยง" กับ Service ของเรา
+    const pastAcceptedOffers = await serviceOfferDirect.OfferDirect.find({
+        service: { $in: serviceIds }, // ค้นหา Offer ที่อยู่ใน Service ID เหล่านี้
+        state: 'ACCEPTED'
+    })
+    .sort({ createdAt: -1 }) // เรียงจากใหม่สุด
+    .limit(10);              // เอาแค่ 10 อัน
+
+    // --- 3. สร้าง "บทสรุป" (Summary) (โค้ดนี้เหมือนเดิม) ---
+    let historySummary = {
+        count_accepted: pastAcceptedOffers.length,
+        avg_price: 0,
+    };
+
+    if (pastAcceptedOffers.length > 0) {
+        const sum = pastAcceptedOffers.reduce((acc, offer) => acc + offer.price, 0);
+        // คำนวณ "ราคาเฉลี่ย" ที่ AI เคยรับงาน
+        historySummary.avg_price = parseFloat((sum / pastAcceptedOffers.length).toFixed(2));
+    }
+
+
+    // 4. สร้าง Context (เหมือนเดิม)
+    const context = {
+        free_slots: freeSlots,
+        total_slots: provider.servicesLimit,
+        offer_history: historySummary, // <-- ใส่ "บทสรุป" (Summary) ใหม่
+        current_offer: {
+            price: offer.price,
+            duration: service.duration
+        }
+    };
+
+        // 5. สร้าง Instructions (คำสั่ง) (สำหรับ Scenario 3&4 - มี Pool)
+    const instructions = `You are a warehouse agent operating in a shared warehouse system. Your goal is to maximize profits while efficiently utilizing storage slots. Based on the provided context, decide what action to take. Options: ['accept', 'reject']`;
+    const promptPayload = { context: context, instructions: instructions };
+
+    try {
+        // 6. ยิง API 
+        const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+            model: "gpt-3.5-turbo", 
+            messages: [
+                { role: "system", content: instructions },
+                { role: "user", content: JSON.stringify(promptPayload, null, 2) }
+            ],
+            temperature: 0.5,
+            max_tokens: 50
+        }, {
+            headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` }
+        });
+
+        const decisionText = response.data.choices[0].message.content.toUpperCase();
+        logger.info(`[AI Agent ${provider._id}] LLM ตอบว่า: ${decisionText}`);
+
+        // 7. แปลผลลัพธ์ (สำหรับ Scenario 3&4 เวอร์ชัน "มี Pool")
+        if (decisionText.includes("ACCEPT")) { 
+            return "accept"; 
+        } 
+        // ถ้า AI ตอบ "REJECT" หรือตอบอย่างอื่น
+        return "reject"; // สำหรับ Scenario 1&2&3&4 (No Pool)
+         // ถ้า AI ตอบ "FORWARD" (เพราะมันถูกเทรนมา) หรือ "REJECT" ให้ถือเป็น "reject" // สำหรับ Scenario 4 (มี Pool)
+
+    } catch (error) {
+        logger.error(`[AI Agent ${provider._id}] LLM Error:`, error.response ? error.response.data.error : error.message);
+        return "reject"; // ถ้า API พัง ให้ reject
+    }
+}
+
+let decisionOfferDirect = (provider, offerDirect) => {
+    return new Promise(async (resolve, reject) => {
+        try {
+            logger.silly("serviceProvider.decisionOfferDirect() called with offerDirect: " + offerDirect._id);
+
+            // AI Logic
+            if (provider.agentType === 'ai') {
+                // เช็ค Slot เต็มหรือไม่ก่อนเรียก AI เพื่อประหยัด Token
+                let count = await serviceService.Service.countDocuments({provider: provider._id, state: "ACTIVE"});
+                if (count >= provider.servicesLimit) {
+                    return resolve("reject");
+                }
+                let decision = await getLLMDecision(provider, offerDirect);
+                return resolve(decision);
+            }
+
+            // Random Logic (Scenario 2: No Pool)
+            logger.silly(`Provider ${provider._id} is RANDOM type.`);
+            let count = await serviceService.Service.countDocuments({provider: provider._id, state: "ACTIVE"});
+            
+            if (count >= provider.servicesLimit) {
+                // เต็มแล้ว = Reject 100%
+                return resolve("reject");
+            } 
+
+            // ยังไม่เต็ม = Accept 50%, Reject 50%, Postpone 0%
+            return resolve(chooseOutcome(0.5, 0.5, 0.0));
+
+        } catch (e) {
+            logger.error("serviceProvider.decisionOfferDirect() error: " + e);
+            reject(e);
+        }
+    })
+}
+
+// Helper Functions (คงเดิม)
+exports.offerCapacityAccepted = (provider, offerCapacity) => { /* ...คงเดิม... */ return Promise.resolve(); }
+exports.offerCapacityPosted = (provider, offerCapacity) => { /* ...คงเดิม... */ return Promise.resolve(); }
+
+let decisionOfferCapacity = (provider, offerCapacity) => {
+    return Promise.resolve("reject"); // Scenario 2 ไม่ใช้ Pool
+}
+
+let chooseOutcome = (acceptProbability, rejectProbability, postponeProbability) => {
+    const randomNumber = Math.random();
+    if (randomNumber < acceptProbability) {
+        return 'accept';
+    } else if (randomNumber < acceptProbability + rejectProbability) {
+        return 'reject';
+    } else {
+        return 'postpone';
+    }
+}
+
+let clcOfferCapacityPrice=(offerDirect)=>{ return offerDirect.price+1; }
+let clcOfferCapacityExpiryTimestamp=(offerDirect)=>{ return offerDirect.expiryTimestamp-1; }
