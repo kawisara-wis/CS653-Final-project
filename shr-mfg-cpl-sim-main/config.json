@@ -1,0 +1,21 @@
+{
+  "db": {
+    "url": "mongodb+srv://markocorn:W8jEFmsFKwBvK1W4@cluster0.olmvpgs.mongodb.net/?retryWrites=true&w=majority",
+    "name": "test"
+  },
+  "agentConsumer": {
+    "count": 1,
+    "settingsOffer": {
+      "expiryDuration": 3600,
+      "priceInterval": [1, 10]
+    }
+  },
+  "service": {
+    "duration" : 1000
+  },
+  "provider": {
+    "count": 1,
+    "servicesLimit": 1
+  },
+  "mode": "silly"
+}

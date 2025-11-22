@@ -1,0 +1,33 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Scenario 2 Simulation Result</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>body { font-family: sans-serif; padding: 20px; text-align: center; } .chart-container { width: 80%; margin: auto; }</style>
+    </head>
+    <body>
+        <h2>Figure 8 Replication: Warehouse Utilization</h2>
+        <div class="chart-container"><canvas id="myChart"></canvas></div>
+        <script>
+            const ctx = document.getElementById('myChart').getContext('2d');
+            new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: ["Agent1","Agent2","Agent3","Agent4","AI"],
+                    datasets: [
+                        { label: 'Warehouse empty', data: ["5.1","8.1","7.6","8.6","15.2"], backgroundColor: '#4f81bd' }, // Blue
+                        { label: '1 slot occupied', data: ["18.2","14.1","14.6","12.6","24.7"], backgroundColor: '#c0504d' }, // Red
+                        { label: '2 slots occupied', data: ["24.2","25.3","23.2","21.2","21.7"], backgroundColor: '#9bbb59' }, // Green
+                        { label: '3 slots occupied', data: ["18.7","25.8","24.7","27.8","17.2"], backgroundColor: '#8064a2' }, // Purple
+                        { label: '4 slots occupied', data: ["21.7","16.2","18.2","17.7","11.6"], backgroundColor: '#4bacc6' }, // Light Blue
+                        { label: '5 slots occupied', data: ["12.1","10.6","11.6","12.1","9.6"], backgroundColor: '#f79646' }  // Orange
+                    ]
+                },
+                options: {
+                    scales: { x: { stacked: false }, y: { beginAtZero: true, max: 100 } }
+                }
+            });
+        </script>
+    </body>
+    </html>
