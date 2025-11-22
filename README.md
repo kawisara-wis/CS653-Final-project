@@ -1,4 +1,4 @@
-# CS653-Final-project
+# CS631-Final-project
 To share the multi-agent system of the warehouse management prototype. We have built MAS on Langchain Framework and used Langgraph as the orchestrator.
 
 First, you need to create a visual environment "python3 -m venv venv" --> "source venv/bin/activate".
